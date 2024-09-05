@@ -164,6 +164,7 @@ The configuration file is YAML formatted and has a number of levels.
 * timeout - How long should a test take to timeout if there's no response? Defaults to 2 seconds.
 * port - the DNS port to test. Defaults to port 53 if unset.
 * disable - the global file to disable all services. No default, but note that without this, you can't disable the server. Remember the config is re-read on each loop so you can add it or change it on the fly.
+* community - this is a global community that is included in the announcement
 * services - the sub tree for defining services
   * `<service name>` - this is the service name that you will reference in the exabgp process configuration (see example)
   * disable - a file for disabling this service
@@ -224,6 +225,7 @@ timeout: 1
 port: 53
 disable: /tmp/disable-all
 debug: 0
+comminty: 65000:101
 services:
   example:
     disable: /tmp/disable-example
@@ -473,6 +475,7 @@ Aug 17 16:19:11 somehost exabgp-watchdog[14368]: example :: INFO :: main::announ
 * IPv4 nameservers are constructed from prefix + index only if the prefix ends 0, but this treatment is not the same as for IPv6 addresses
 * Consider modifying to cater testing for non 0 network boundary announcements
 * Make the config file a CLI parameter
+* Add per-prefix and/or per-service community support
 
 ## Bug Reporting
 

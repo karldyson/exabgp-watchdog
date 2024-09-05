@@ -73,13 +73,14 @@ while() {
 	my $service = $config->{services}->{$serviceName};
 
 	# set the service parameters from global, if not defined in the service
-	for(qw/nexthop.ip4 nexthop.ip6 localpref metric rise fall interval timeout port/) {
+	for(qw/nexthop.ip4 nexthop.ip6 localpref metric rise fall interval timeout port community/) {
 		$service->{$_} ||= $config->{$_};
 	}
 
 	# set some sensible defaults if required parameters are still unset
 	$service->{localpref} ||= 100;
 	$service->{metric} ||= 100;
+	$service->{community} ||= "none";
 	$service->{'nexthop.ip4'} ||= $state->{'self.ip4'};
 	$service->{'nexthop.ip6'} ||= $state->{'self.ip6'};
 	$service->{interval} ||= 2;
@@ -440,7 +441,7 @@ while() {
 	logit("STATE :: L:$state->{loop}; C:$state->{current}; P:$state->{previous}; R:$state->{rising}/$service->{rise}; F:$state->{falling}/$service->{fall}; Tests F:$checksFailed P:$checksPassed T:$checksTotal; Time L:$state->{loopTime}; T:$state->{testTime}");
 
 	# work out if the metrics for the announcements have changed
-	for(qw/localpref nexthop.ip4 nexthop.ip6 metric/) {
+	for(qw/localpref nexthop.ip4 nexthop.ip6 metric community/) {
 		logit("checking state of $_; $state->{service}->{$_} -> $service->{$_}", 'debug');
 		if(! $state->{service}->{$_}) {
 			logit("$_ initialised to $service->{$_}");
@@ -500,8 +501,10 @@ sub announce {
 	}
 	for my $prefixSet (qw/ip4 ip6/) {
 		for(@{$service->{prefixes}->{$prefixSet}}) {
-			print qq|announce route $_ next-hop $service->{"nexthop.$prefixSet"} local-preference $service->{localpref} med $service->{metric}\n|;
-			logit(qq|announce route $_ next-hop $service->{"nexthop.$prefixSet"} local-preference $service->{localpref} med $service->{metric}|);
+			my $string = qq|announce route $_ next-hop $service->{"nexthop.$prefixSet"} local-preference $service->{localpref} med $service->{metric}|;
+			$string .= qq| community [$service->{community}]| if $service->{community} =~ m/^\d+:\d+/;
+			print qq|$string\n|;
+			logit($string);
 		}
 	}
 	$state->{announced} = 1;
@@ -518,8 +521,10 @@ sub withdraw {
 	}
 	for my $prefixSet (qw/ip4 ip6/) {
 		for(@{$service->{prefixes}->{$prefixSet}}) {
-			print qq|withdraw route $_ next-hop $service->{"nexthop.$prefixSet"} local-preference $service->{localpref} med $service->{metric}\n|;
-			logit(qq|withdraw route $_ next-hop $service->{"nexthop.$prefixSet"} local-preference $service->{localpref} med $service->{metric}|);
+			my $string = qq|withdraw route $_ next-hop $service->{"nexthop.$prefixSet"} local-preference $service->{localpref} med $service->{metric}|;
+			$string .= qq| community [$service->{community}]| if $service->{community} =~ m/^\d+:\d+/;
+			print qq|$string\n|;
+			logit($string);
 		}
 	}
 	$state->{announced} = 0;
