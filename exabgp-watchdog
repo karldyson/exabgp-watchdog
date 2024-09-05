@@ -1,0 +1,554 @@
+#!/usr/bin/env perl
+
+$|++;
+
+use strict;
+use YAML qw/LoadFile/;
+use Data::Dumper;
+use Sys::Syslog;
+use File::Basename;
+use Time::HiRes qw/time/;
+use IO::Socket::INET;
+use IO::Socket::INET6;
+use LWP::UserAgent;
+use JSON;
+use Sys::Hostname;
+
+# determine my hostname
+my $hostname = hostname();
+$hostname =~ s/\..*$//;
+
+# open the syslog
+openlog(basename($0), 'pid', 'local7') || die "can't open syslog: $!\n";
+
+# grab the service name from the cli arg, and barf if none presented
+# we'll validate the servicename later, as we re-read the config each cycle and so need to cope
+# with the service definition disappearing
+my $serviceName = shift;
+unless($serviceName) {
+	barf("no service specified", 'alert');
+}
+
+# initialise a variable for storing the general state in
+my $state;
+$state->{startup} = time();
+$state->{current} = 'DOWN';
+$state->{previous} = 'INIT';
+
+# determine my local IP default facing IP addresses
+my $socket = IO::Socket::INET->new(Proto => 'udp', PeerAddr => '169.254.169.254', PeerPort => 53);
+$state->{'self.ip4'} = $socket->sockhost;
+$socket->close;
+$socket = IO::Socket::INET6->new(Proto => 'udp', PeerAddr => '2001:db8::1', PeerPort => 53);
+$state->{'self.ip6'} = $socket->sockhost;
+$socket->close;
+undef $socket;
+
+# initialise signal handlers
+$SIG{INT} = sub { withdraw($state->{service}); die "caught SIGINT\n"; };
+$SIG{TERM} = sub { withdraw($state->{service}); die "caught SIGTERM\n"; };
+$SIG{USR1} = sub { $state->{usr1} = $state->{loop}; logit("usr1 initialised to $state->{usr1}"); };
+$SIG{USR2} = sub { $state->{usr2} = 1; };
+
+# begin the main loop
+while() {
+	logit("== Loop $state->{loop} Begin ==", 'debug');
+	$state->{loopStart} = time();
+
+	# load config file. barfs if the file cannot be found. we need to catch the barf and withdraw.
+	my $config;
+	eval {
+		$config = LoadFile('/usr/local/etc/exabgp-watchdog.yaml');
+	};
+	barf("YAML config file problem\n$@",'alert') if $@;
+	$state->{debug} = $config->{debug};
+	$state->{debug} = 1 if $state->{usr1};
+
+	# check the service name is defined, or we're screwed. withdraw if not defined
+	unless(grep /^$serviceName$/, keys %{$config->{services}}) {
+		barf("$serviceName isn't defined\nValid choices are : ".join(", ", keys %{$config->{services}}));;
+	}
+
+	# grab the service definition from the config
+	my $service = $config->{services}->{$serviceName};
+
+	# set the service parameters from global, if not defined in the service
+	for(qw/nexthop.ip4 nexthop.ip6 localpref metric rise fall interval timeout port/) {
+		$service->{$_} ||= $config->{$_};
+	}
+
+	# set some sensible defaults if required parameters are still unset
+	$service->{localpref} ||= 100;
+	$service->{metric} ||= 100;
+	$service->{'nexthop.ip4'} ||= $state->{'self.ip4'};
+	$service->{'nexthop.ip6'} ||= $state->{'self.ip6'};
+	$service->{interval} ||= 2;
+	$service->{timeout} ||= 2;
+	$service->{port} ||= 53;
+	$service->{rise} ||= 5;
+	$service->{fall} ||= 3;
+
+	# if the next hop is set to 'self', swap it for the IP addresses we determined earlier
+	$service->{'nexthop.ip4'} = $state->{'self.ip4'} if $service->{'nexthop.ip4'} eq 'self';
+	$service->{'nexthop.ip6'} = $state->{'self.ip6'} if $service->{'nexthop.ip6'} eq 'self';
+
+	# dump the state to a file here on usr2?
+	if($state->{usr2}) {
+		delete $state->{usr2};
+		logit("dumping state to /tmp/exabgp-watchdog.$serviceName.state");
+		require Data::Dumper;
+		$Data::Dumper::Terse = 1;
+		if(open(S, ">/tmp/exabgp-watchdog.$serviceName.state")) {
+			print S scalar localtime . "\n";
+			print S "== STATE ==\n";
+			print S Dumper($state);
+			print S "== CONFIG ==\n";
+			print S Dumper($config);
+			print S "== SERVICE ==\n";
+			print S Dumper($service);
+			close S;
+		} else {
+			logit("SIGUSR2 handler could not dump state to /tmp/exabgp-watchdog.$serviceName.state: $!");
+		}
+	}
+
+	# set the previous state, before we check this loop and overwrite current
+	$state->{previous} = $state->{current};
+
+	# check if the service is disabled
+	if(-f $service->{disable}) {
+		$state->{current} = 'DISABLED';
+		logit("Service is disabled by $service->{disable}");
+	}
+	# or if there's a global disable
+	elsif(-f $config->{disable}) {
+		$state->{current} = 'DISABLED';
+		logit("Service is globally disabled by $config->{disable}");
+	}
+	# else set the service to DOWN to force checking through RISING to UP
+	elsif($state->{previous} eq 'DISABLED') {
+		$state->{current} = 'DOWN';
+		logit("Previously disabled service has been re-enabled");
+	}
+	else {
+		logit("The service isn't disable, and wasn't in the previous loop, either", 'debug');
+	}
+
+	# if the service isn't disabled, check it
+	my $checksPassed = 0;
+	my $checksFailed = 0;
+	my $checksTotal = 0;
+	$state->{testStart} = time();
+	unless($state->{current} eq 'DISABLED') {
+		# we should really make these do a require for a test plugin
+		if($service->{check}->{type} eq 'authdns') {
+			logit("performing authdns check", 'debug');
+			require Net::DNS;
+			my $resolver = new Net::DNS::Resolver;
+			$resolver->recurse(0);
+			$resolver->dnssec(0);
+			$resolver->retry(1);
+			$resolver->retrans(1);
+			$resolver->defnames(0);
+			$resolver->dnsrch(0);
+			$resolver->udp_timeout($service->{timeout});
+			$resolver->tcp_timeout($service->{timeout});
+			$resolver->port($service->{port});
+			$resolver->persistent_udp(1);
+			$resolver->persistent_tcp(0);
+
+			delete $state->{masterTimeout};
+
+			CHECK: for my $item (@{$service->{check}->{items}}) {
+				logit("checking name $item->{qname}", 'debug');
+
+				$item->{maxage} ||= $service->{check}->{maxage};
+
+				# get the serial from the master in order to check the slave
+				my $master = $item->{master} || $service->{check}->{master} || undef;
+				if($service->{check}->{checkmaster} eq 'yes' && $master && !$state->{masterTimeout}->{$master}) {
+					logit("checking $item->{qname} against master $master",'debug');
+					$resolver->nameservers($master);
+					my $masterResponse;
+					eval {
+						local $SIG{ALRM} = sub { die "alarm\n"; };
+						alarm $service->{timeout};
+						$masterResponse = $resolver->query("$item->{qname}.", 'SOA');
+						alarm 0;
+					};
+					if($masterResponse) {
+						if($masterResponse->header->rcode eq 'NOERROR' && $masterResponse->header->aa) {
+							for my $rr ($masterResponse->answer) {
+								next unless $rr->type eq 'SOA';
+								$item->{masterSerial} = $rr->serial;
+							}
+						} else {
+							logit("master serial lookup for $item->{qname} failed: rcode: ".$masterResponse->header->rcode, 'err');
+							$state->{masterTimeout}->{$master} = 1;
+						}
+					} else {
+						my $errorstring = $resolver->errorstring ne 'unknown error or no error' ? $resolver->errorstring : "timeout alarm";
+						logit("master serial lookup for $item->{qname} failed: errorstring: $errorstring\n", 'err');
+						$state->{masterTimeout}->{$master} = 1;
+					}
+				}
+
+				for my $prefixSet (qw/ip4 ip6/) {
+					my $prefixCount = $service->{prefixes}->{$prefixSet} ? scalar @{$service->{prefixes}->{$prefixSet}} : 0;
+					logit("checking $prefixCount prefixes in prefix set $prefixSet", 'debug');
+					for my $prefix (@{$service->{prefixes}->{$prefixSet}}) {
+						logit("checking prefix $prefix", 'debug');
+						my $nameserver = $prefix;
+						my $index = $item->{index} || $service->{check}->{index} || barf("no index can be located for check item $item->{qname}");
+						if($prefixSet eq 'ip4') {
+							$nameserver =~ s|\.0/\d+$|.$index|;
+						}
+						elsif($prefixSet eq 'ip6') {
+							$nameserver =~ s|/\d+$|$index|;
+						}
+						logit("checking nameserver $nameserver", 'debug');
+						$resolver->nameservers($nameserver);
+						$checksTotal++;
+
+						my $response;
+						my $tS = time();
+						eval {
+							local $SIG{ALRM} = sub { die "alarm\n"; };
+							alarm $service->{timeout};
+							$response = $resolver->query("$item->{qname}.", 'SOA');
+							alarm 0;
+						};
+						$tS = sprintf "%.4f", time() - $tS;
+
+						if($response) {
+							if($response->header->rcode eq 'NOERROR' && $response->header->aa) {
+								logit("$prefixSet -> $prefix -> $item->{qname} -> $nameserver -> ok ($tS)", 'debug');
+								for my $rr ($response->answer) {
+									next unless $rr->type eq 'SOA';
+									$item->{slaveSerial} = $rr->serial;
+								}
+								$checksPassed++;
+							} else {
+								logit(sprintf("%s -> %s -> %s -> %s -> failed ($tS), rcode: %s. aa: %s\n", $prefixSet, $prefix, $item->{qname}, $nameserver, $response->header->rcode, $response->header->aa), 'err');
+								$checksFailed++;
+							}
+						} else {
+							my $errorstring = $resolver->errorstring ne 'unknown error or no error' ? $resolver->errorstring : "timeout alarm";
+							logit(sprintf("%s -> %s -> %s -> %s -> failed ($tS), errorstring: %s\n", $prefixSet, $prefix, $item->{qname}, $nameserver, $errorstring), 'err');
+							$checksFailed++;
+						}
+
+						# check the serial against the master serial
+						if($service->{check}->{checkmaster} eq 'yes' && $item->{masterSerial} && $item->{slaveSerial} && $item->{maxage}) {
+							logit("checking slave serial against master $master serial $item->{masterSerial}", 'debug');
+							my $age = $item->{masterSerial} - $item->{slaveSerial};
+							$age *= -1 if $age < 0;
+							logit("$item->{qname} has age $age when comparing serial $item->{masterSerial} from $master against $item->{slaveSerial}",'debug');
+							if($age > $item->{maxage}) {
+								logit("$item->{qname} age $age failed age $item->{maxage} against master ($item->{masterSerial} <-> $item->{slaveSerial})", 'err');
+								$checksFailed++;
+							} else {
+								logit("$item->{qname} age $age passed age $item->{maxage} against master ($item->{masterSerial} <-> $item->{slaveSerial})", 'debug');
+							}
+						}
+
+						if($checksFailed) {
+							logit('test failed, bailing from check sequence','debug');
+							last CHECK;
+						}
+					}
+				}
+			}
+		}
+		elsif($service->{check}->{type} eq 'recursivedns') {
+			logit("performing recursivedns check", 'debug');
+			require Net::DNS;
+			my $resolver = new Net::DNS::Resolver;
+			$resolver->recurse(1);
+			$resolver->dnssec(0);
+			$resolver->retry(1);
+			$resolver->retrans(1);
+			$resolver->defnames(0);
+			$resolver->dnsrch(0);
+			$resolver->udp_timeout($service->{timeout});
+			$resolver->tcp_timeout($service->{timeout});
+			$resolver->port($service->{port});
+			$resolver->persistent_udp(1);
+			$resolver->persistent_tcp(0);
+
+			CHECK: for my $item (@{$service->{check}->{items}}) {
+				logit("checking name $item->{qname}", 'debug');
+
+				for my $prefixSet (qw/ip4 ip6/) {
+					my $prefixCount = $service->{prefixes}->{$prefixSet} ? scalar @{$service->{prefixes}->{$prefixSet}} : 0;
+					logit("checking $prefixCount prefixes in prefix set $prefixSet", 'debug');
+					for my $prefix (@{$service->{prefixes}->{$prefixSet}}) {
+						logit("checking prefix $prefix", 'debug');
+						my $nameserver = $prefix;
+						my $index = $item->{index} || $service->{check}->{index} || barf("no index can be located for check item $item->{qname}");
+						my $qtype = $item->{qtype} || $service->{check}->{qtype} || 'A';
+						my $match = $item->{match} || $service->{check}->{match} || '127.0.0.1';
+						if($prefixSet eq 'ip4') {
+							$nameserver =~ s|\.0/\d+$|.$index|;
+						}
+						elsif($prefixSet eq 'ip6') {
+							$nameserver =~ s|/\d+$|$index|;
+						}
+						logit("checking nameserver $nameserver", 'debug');
+						$resolver->nameservers($nameserver);
+						$checksTotal++;
+
+						my $response;
+						my $tS = time();
+						eval {
+							local $SIG{ALRM} = sub { die "alarm\n"; };
+							alarm $service->{timeout};
+							$response = $resolver->query("$item->{qname}.", $qtype);
+							alarm 0;
+						};
+						$tS = sprintf "%.4f", time() - $tS;
+
+						if($response) {
+							if($response->header->rcode eq 'NOERROR') {
+								logit("$prefixSet -> $prefix -> $item->{qname} -> $nameserver -> ok ($tS)", 'debug');
+								for my $rr ($response->answer) {
+									next unless $rr->type eq $qtype;
+									if($rr->rdstring eq $match) {
+										$checksPassed++;
+										logit("$item->{qname} passed rdata match (".$rr->rdstring.") matched $match", 'debug');
+									} else {
+										$checksFailed++;
+										logit("$item->{qname} failed rdata match (".$rr->rdstring.") does not match $match", 'err');
+									}
+								}
+							} else {
+								logit(sprintf("%s -> %s -> %s -> %s -> failed ($tS), rcode: %s\n", $prefixSet, $prefix, $item->{qname}, $nameserver, $response->header->rcode), 'err');
+							}
+						} else {
+							my $errorstring = $resolver->errorstring ne 'unknown error or no error' ? $resolver->errorstring : "timeout alarm";
+							logit(sprintf("%s -> %s -> %s -> %s -> failed ($tS), errorstring: %s\n", $prefixSet, $prefix, $item->{qname}, $nameserver, $errorstring), 'err');
+							$checksFailed++;
+						}
+
+						if($checksFailed) {
+							logit('test failed, bailing from check sequence','debug');
+							last CHECK;
+						}
+					}
+				}
+			}
+		}
+		elsif($service->{check}->{type} eq 'forcedup') {
+			$checksTotal++;
+			$checksPassed++;
+			$checksFailed = 0;
+		}
+		elsif($service->{check}->{type} eq 'forceddown') {
+			$checksTotal++;
+			$checksPassed = 0;
+			$checksFailed++;
+		}
+		else {
+			barf("service check type $service->{check}->{type} isn't defined");
+		}
+	}
+	$state->{testTime} = sprintf "%.4f", time() - $state->{testStart};
+
+	if($state->{current} eq 'DISABLED') {
+		$state->{rising} = 0;
+		$state->{falling} = 0;
+		logit("the service is DISABLED (was $state->{previous})");
+		status('DISABLED');
+	}
+	elsif($checksTotal == $checksPassed && $checksFailed == 0) {
+		if($state->{current} eq 'UP') {
+			$state->{rising} = 0;
+			$state->{falling} = 0;
+			logit("the service is still UP", 'debug');
+			status('UP');
+		}
+		elsif($state->{current} eq 'RISING') {
+			$state->{rising}++;
+			$state->{falling} = 0;
+			if($state->{rising} == $service->{rise}) {
+				$state->{current} = 'UP';
+				logit("the service is now UP");
+				$state->{rising} = 0;
+				status('RISING->UP');
+			} else {
+				logit("the service is still RISING", 'debug');
+				status("RISING $state->{rising}/$service->{rise}");
+			}
+		}
+		elsif($state->{current} eq 'FALLING') {
+			$state->{rising} = 0;
+			$state->{falling} = 0;
+			logit("the service is changing state from FALLING to UP");
+			$state->{current} = 'UP';
+			status("FALLING->UP");
+		}
+		elsif($state->{current} eq 'DOWN') {
+			$state->{rising} = 1;
+			$state->{falling} = 0;
+			logit("the service is changing state from DOWN to RISING");
+			$state->{current} = 'RISING';
+			status("DOWN->RISING $state->{rising}/$service->{rise}");
+		}
+		else {
+			barf("service is in an unknown state: $state->{current}");
+			status('UNKNOWN/CHECKS-PASSED');
+		}
+	} else {
+		if($state->{current} eq 'UP') {
+			$state->{rising} = 0;
+			$state->{falling}++;
+			logit("the service is changing state from UP to FALLING");
+			$state->{current} = 'FALLING';
+			status("UP->FALLING $state->{falling}/$service->{fall}")
+		}
+		elsif($state->{current} eq 'RISING') {
+			$state->{rising} = 0;
+			$state->{falling} = 1;
+			logit("the service is changing state from RISING to DOWN");
+			$state->{current} = 'DOWN';
+			status('RISING->DOWN');
+		}
+		elsif($state->{current} eq 'FALLING') {
+			$state->{rising} = 0;
+			$state->{falling}++;
+			if($state->{falling} == $service->{fall}) {
+				$state->{current} = 'DOWN';
+				logit("the service is now DOWN");
+				$state->{falling} = 0;
+				status('FALLING->DOWN');
+			} else {
+				logit("the service is FALLING");
+				status("FALLING $state->{falling}/$service->{fall}");
+			}
+		}
+		elsif($state->{current} eq 'DOWN') {
+			$state->{rising} = 0;
+			$state->{falling} = 0;
+			logit("the service is still DOWN", 'debug');
+			status('DOWN');
+		}
+		else {
+			status('UNKNOWN/CHECKS-FAILED');
+			barf("service is in an unknown state: $state->{current}");
+		}
+	}
+	logit("STATE :: L:$state->{loop}; C:$state->{current}; P:$state->{previous}; R:$state->{rising}/$service->{rise}; F:$state->{falling}/$service->{fall}; Tests F:$checksFailed P:$checksPassed T:$checksTotal; Time L:$state->{loopTime}; T:$state->{testTime}");
+
+	# work out if the metrics for the announcements have changed
+	for(qw/localpref nexthop.ip4 nexthop.ip6 metric/) {
+		logit("checking state of $_; $state->{service}->{$_} -> $service->{$_}", 'debug');
+		if(! $state->{service}->{$_}) {
+			logit("$_ initialised to $service->{$_}");
+		}
+		elsif($state->{service}->{$_} ne $service->{$_}) {
+			logit("$_ has changed from $state->{service}->{$_} to $service->{$_}");
+			$state->{reannounce}++;
+		}
+	}	
+
+	# adjust the announcements if necessary
+	if($state->{current} eq $state->{previous}) {
+		if($state->{current} eq 'UP' && $state->{reannounce}) {
+			logit("service config changed, we need to reannounce");
+			withdraw($state->{service});
+			announce($service);
+		} else {
+			logit("nothing to do with announcements for no state change", 'debug');
+		}
+	}
+	elsif($state->{current} eq 'UP') {
+		logit("service has just come up, evaluate whether to announce");
+		announce($service);
+	}
+	elsif($state->{current} eq 'DOWN') {
+		logit("service has just gone down, evaluate whether to withdraw");
+		withdraw($state->{service});
+	}
+	elsif($state->{current} eq 'DISABLED') {
+		logit("service has been DISABLED, we need to withdraw");
+		withdraw($state->{service});
+	}
+	else {
+		logit("nothing to do with announcements for state $state->{current}", 'debug');
+	}
+
+	$state->{service} = $service;
+	$state->{reannounce} = 0;
+	logit("== Loop $state->{loop} End - Sleeping $service->{interval} ==", 'debug');
+	if($state->{usr1} && $state->{usr1} < $state->{loop}) {
+		logit("usr1 tidyup at $state->{loop}");
+		delete $state->{usr1};
+		delete $state->{debug} unless $config->{debug};
+	}
+	$state->{loop}++;
+	$state->{loopTime} = sprintf "%.4f", time() - $state->{loopStart};
+	sleep $service->{interval};
+}
+
+# subroutine to announce prefixes
+# generally, you'll pass it the $service variable to announce the current service spec
+sub announce {
+	my $service = shift || die "no service passed to announce\n";
+	if($state->{announced}) {
+		logit("already announced", 'debug');
+		return;
+	}
+	for my $prefixSet (qw/ip4 ip6/) {
+		for(@{$service->{prefixes}->{$prefixSet}}) {
+			print qq|announce route $_ next-hop $service->{"nexthop.$prefixSet"} local-preference $service->{localpref} med $service->{metric}\n|;
+			logit(qq|announce route $_ next-hop $service->{"nexthop.$prefixSet"} local-preference $service->{localpref} med $service->{metric}|);
+		}
+	}
+	$state->{announced} = 1;
+}
+
+# subroutine to withdraw the prefixes.
+# generally, you'd want it to withdraw what was announced, which, if you just detected changes in localpref etc
+# will be in $state->{service} and not in $service (which contains the *current* service)
+sub withdraw {
+	my $service = shift;
+	unless($state->{announced}) {
+		logit("there are no announced prefixes to withdraw", 'debug');
+		return;
+	}
+	for my $prefixSet (qw/ip4 ip6/) {
+		for(@{$service->{prefixes}->{$prefixSet}}) {
+			print qq|withdraw route $_ next-hop $service->{"nexthop.$prefixSet"} local-preference $service->{localpref} med $service->{metric}\n|;
+			logit(qq|withdraw route $_ next-hop $service->{"nexthop.$prefixSet"} local-preference $service->{localpref} med $service->{metric}|);
+		}
+	}
+	$state->{announced} = 0;
+}
+
+# subroutine to update the string seen in a process listing
+sub status {
+	my $state = shift;
+	$0 = "EXABGP Watchdog $serviceName $state";
+}
+
+# subroutine to deal with logging different levels at different times
+sub logit {
+	chomp(my $input = shift);
+	$input =~ s/\n/ :: /g;
+	my $level = shift || 'info';
+	my $caller = (caller(1))[3] || 'main';
+	my $string = $serviceName . " :: " . uc($level) . " :: " . $caller . " :: ";
+	$string .= $input;
+	print "$state->{debug} :: $string\n" if $ENV{EXABGPINTERACTIVEDEBUG};
+	syslog($level, $string) if $level eq 'debug' && $state->{debug};
+	syslog($level, $string) unless $level eq 'debug';
+}
+
+# a subroutine that takes a string, withdraws the prefixes, logs a fatal, and dies
+sub barf {
+	my $string = shift;
+	withdraw($state->{service});
+	logit("BARF :: $string", 'alert');
+	die "$string\n";
+}
+

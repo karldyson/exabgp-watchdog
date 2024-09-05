@@ -1,0 +1,25 @@
+localpref: 100
+metric: 100
+interval: 3
+rise: 5
+fall: 2
+timeout: 1
+port: 53
+disable: /tmp/disable-all
+debug: 0
+nexthop.ip4: self
+nexthop.ip6: self
+community: 65000:1
+services:
+  example:
+    disable: /tmp/disable-example
+    check:
+      type: authdns
+      index: 53
+      items:
+        - qname: example.net
+    prefixes:
+      ip4:
+        - 192.0.2.0/24
+      ip6:
+        - 2001:db8:53::/48

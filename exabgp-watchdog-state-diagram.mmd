@@ -1,0 +1,18 @@
+```mermaid
+stateDiagram
+  [*] --> INIT
+  INIT --> DOWN
+  DOWN --> RISING
+  RISIING --> DOWN
+  RISING --> UP
+  UP --> FALLING
+  FALLING --> DOWN
+  DOWN --> DOWN
+  RISING --> RISING
+  UP --> UP
+  DOWN --> DISABLED
+  RISING --> DISABLED
+  FALLING --> DISABLED
+  UP --> DISABLED
+  DISABLED --> DOWN
+```
