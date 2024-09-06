@@ -26,6 +26,12 @@ If parameters relating to the announced prefixes change, such as, but not limite
 
 The watchdog requires multiple consecutive tests to pass in order for the state to transition from **DOWN** to **UP** and simillarly, to fail in order to transition from **UP** to **DOWN**. This mechanism is configurable, and exists to minimise the flapping of prefixes to BGP peers in the event of mis-behaving service.
 
+This is, fundamentally, aimed at automating the announce and withdraw of one or more prefixes in an anycast network.
+
+It can include BGP communities, including support for large communities, although this is global at the present time. Per prefix communities are planned so you can steer traffic etc with provider communities. The initial implementation is aimed at the ability to announce prefixes with communities that assist in troubleshooting which of the anycast nodes originated a given prefix.
+
+It's suitable for use both internally for simple load spreading via ECMP, as well as externally to announce to eBGP upstream providers.
+
 ## Checks
 
 The IP to test is constructed from the prefix, with the last octet replaced by the index. The watchdog is written for the scenario of advertising a v4 /24 (and/or v6 /48), further, that if the service has both IPv4 and IPv6 preixes, the last part of the IP is the same. If the last part of the prefix is not 0, the index is not used, and the prefix is tested verbatim (if you're advertising IPv4 /32 for example). See the TODO section.
@@ -164,7 +170,8 @@ The configuration file is YAML formatted and has a number of levels.
 * timeout - How long should a test take to timeout if there's no response? Defaults to 2 seconds.
 * port - the DNS port to test. Defaults to port 53 if unset.
 * disable - the global file to disable all services. No default, but note that without this, you can't disable the server. Remember the config is re-read on each loop so you can add it or change it on the fly.
-* community - this is a global community that is included in the announcement
+* community - this is a global (set of) community/ies that will be included in any announcement(s)
+* large_community - this is a global (set of) large community/ies that will be included in any announcement(s)
 * services - the sub tree for defining services
   * `<service name>` - this is the service name that you will reference in the exabgp process configuration (see example)
   * disable - a file for disabling this service
@@ -225,7 +232,8 @@ timeout: 1
 port: 53
 disable: /tmp/disable-all
 debug: 0
-comminty: 65000:101
+community: 65000:101 65001:202
+large_community: 65000:101:202 65002:12345:6789
 services:
   example:
     disable: /tmp/disable-example

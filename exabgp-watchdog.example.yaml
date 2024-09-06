@@ -9,7 +9,8 @@ disable: /tmp/disable-all
 debug: 0
 nexthop.ip4: self
 nexthop.ip6: self
-community: 65000:1
+community: 65000:1 65001:3
+large_community: 65000:1:1 65001:2:3
 services:
   example:
     disable: /tmp/disable-example
