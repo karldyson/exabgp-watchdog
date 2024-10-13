@@ -1,5 +1,12 @@
 ```mermaid
+---
+config:
+  look: neo
+  layout: elk
+  theme: default
+---
 stateDiagram
+  direction TB
   [*] --> INIT
   INIT --> DOWN
   DOWN --> RISING
